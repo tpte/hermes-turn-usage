@@ -6,6 +6,7 @@
 import importlib.util
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,8 +66,8 @@ class TestSettings(unittest.TestCase):
 
     def test_broken_float_setting_falls_back(self):
         plugin._CTX = FakeCtx({"price_in": "not-a-number", "price_out": 0})
-        self.assertEqual(plugin._fsetting("price_in", 0.14), 0.14)
-        self.assertEqual(plugin._fsetting("price_out", 0.42), 0.42)
+        self.assertIsNone(plugin._price_setting("price_in"))
+        self.assertIsNone(plugin._price_setting("price_out"))
 
 
 class TestEnabledGate(unittest.TestCase):
@@ -100,9 +101,16 @@ class TestUnitPrices(unittest.TestCase):
     def test_settings_when_given(self):
         self.assertEqual(plugin._unit_prices("any-alias", (1.0, 2.0, 3.0)), (1.0, 2.0, 3.0))
 
+    def test_unit_prices_overrides_only_the_items_that_are_set(self):
+        """只設其中一項時，其餘兩項仍用 provider 價格列（不是整組被蓋掉）。"""
+        with unittest.mock.patch.dict(plugin.PROVIDER_PRICES, {"some-alias": (1.0, 2.0, 3.0)}):
+            self.assertEqual(plugin._unit_prices("some-alias", (None, 0.5, None)), (1.0, 0.5, 3.0))
+            self.assertEqual(plugin._unit_prices("some-alias", (None, None, None)), (1.0, 2.0, 3.0))
+
     def test_builtin_table_when_no_settings(self):
-        self.assertEqual(plugin._unit_prices("example-alias-a"),
-                         plugin.PROVIDER_PRICES["example-alias-a"])
+        """測試不依賴 repo 內那張價格表的實際內容（可換成自己的 provider）。"""
+        with unittest.mock.patch.dict(plugin.PROVIDER_PRICES, {"some-alias": (1.0, 2.0, 3.0)}):
+            self.assertEqual(plugin._unit_prices("some-alias"), (1.0, 2.0, 3.0))
 
     def test_fallback_for_unknown_alias(self):
         self.assertEqual(plugin._unit_prices("who-knows"), plugin.FALLBACK_PRICES)

@@ -117,12 +117,17 @@ PROVIDER_PRICES = {
 FALLBACK_PRICES = (0.30, 0.006, 1.20)
 
 
-def _unit_prices(provider: str, prices=None):
-    """(輸入, 快取, 輸出) 的 $/M 單價：以設定（price_in／price_cache／price_out）為準，
-    沒傳設定才退回內建的範例價格表。"""
-    if prices is not None:
-        return prices
-    return PROVIDER_PRICES.get((provider or "").lower(), FALLBACK_PRICES)
+def _unit_prices(provider: str, overrides=None):
+    """(輸入, 快取, 輸出) 的 $/M 單價。
+
+    基底是內建的 provider 價格列；使用者若**明確**設定 price_in／price_cache／price_out，
+    就逐項覆蓋該列（沒設的那一項仍用 provider 的價）。「沒設定」在這裡必須是 None：
+    一旦塞了預設數字（例如 0.14），整張 provider 價格列就被那個數字蓋掉、等於失效。
+    """
+    base = PROVIDER_PRICES.get((provider or "").lower(), FALLBACK_PRICES)
+    if not overrides:
+        return base
+    return tuple(o if o is not None else b for o, b in zip(overrides, base))
 
 _TOTALS_SQL = """
     SELECT model, billing_provider, task, SUM(api_call_count), SUM(input_tokens),
@@ -149,8 +154,8 @@ def _connect() -> sqlite3.Connection:
 def load_totals(session_id: str, prices=None):
     """該 session 的累計（含全部 task）。主對話的 provider 另外列出當「路由」。
 
-    ``prices`` 是 (輸入, 快取, 輸出) 的 $/M 單價三元組，由外掛設定提供；
-    沒給才退回內建的範例價格表。
+    ``prices`` 是 (輸入, 快取, 輸出) 的 $/M 單價**覆蓋**三元組（元素可為 None）；
+    沒給、或該項為 None 的，用內建的 provider 價格列。
     """
     try:
         con = _connect()
@@ -166,7 +171,8 @@ def load_totals(session_id: str, prices=None):
         return None
 
     totals = {"calls": 0, "in": 0, "out": 0, "cache": 0, "cost": 0.0, "cost_est": 0.0,
-              "reasoning": 0, "model": "", "providers": []}
+              "reasoning": 0, "model": "", "providers": [],
+              "prices": _unit_prices("", prices)}
     top_calls = -1
     for model, provider, task, calls, tin, tout, tcache, treason, est in rows:
         totals["calls"] += calls or 0
@@ -181,6 +187,7 @@ def load_totals(session_id: str, prices=None):
         totals["cost_est"] += est or 0.0
         if model and (calls or 0) > top_calls:
             top_calls, totals["model"] = (calls or 0), model
+            totals["prices"] = (pin, pc, po)  # 顯示用單價跟著主要 provider
         if task == "" and provider and provider not in totals["providers"]:
             totals["providers"].append(provider)
     return totals
@@ -400,13 +407,21 @@ def _setting(key: str, default):
     return default
 
 
-def _fsetting(key: str, default: float) -> float:
-    """讀 float 設定；值不合法或為 0 時退回預設（單價 0 沒有意義）。"""
+def _price_setting(key: str):
+    """使用者**明確設定**的單價；沒設定／不合法／<=0 一律回 None。
+
+    刻意不傳預設值：`_setting(key, None)` 對未設定的鍵回 None，正好能分辨
+    「沒設定」（沿用 provider 價格列）與「設了值」（覆蓋）——若這裡補上預設數字，
+    等於把 provider 價格列整張蓋掉。
+    """
+    raw = _setting(key, None)
+    if raw is None or raw == "":
+        return None
     try:
-        value = float(_setting(key, default))
+        value = float(raw)
     except (TypeError, ValueError):
-        return default
-    return value or default
+        return None
+    return value if value > 0 else None
 
 
 def _composition_groups():
@@ -439,12 +454,14 @@ def transform(response_text, session_id, model, platform, **kwargs):
             return None
         if not response_text or not session_id:
             return None
-        prices = (_fsetting("price_in", 0.14),
-                  _fsetting("price_cache", 0.0042),
-                  _fsetting("price_out", 0.42))
-        totals = load_totals(session_id, prices)
+        # 單價設定是逐項覆蓋 provider 價格列；沒設定的項目保持 None。
+        overrides = tuple(_price_setting(k)
+                          for k in ("price_in", "price_cache", "price_out"))
+        totals = load_totals(session_id, overrides)
         if not totals:
             return None
+        # 顯示用單價＝實際套用的那一組（主要 provider 的價格列 ＋ 使用者覆蓋）
+        eff_prices = totals.get("prices") or _unit_prices("", overrides)
         # 診斷用：一次 turn 內這個 hook 到底被叫了幾次、各帶哪個 session_id。
         # 症狀是一則回覆被附加多份摘要，而每份的「累計」不同 ——
         # 那就是不同 session_id 各被叫了一次。要判定得先有這行紀錄。
@@ -501,9 +518,9 @@ def transform(response_text, session_id, model, platform, **kwargs):
             show_composition=bool(_setting("show_composition", True)),
             show_bars=bool(_setting("show_bars", True)),
             show_cost_breakdown=bool(_setting("show_cost_breakdown", True)),
-            price_in=prices[0],
-            price_cache=prices[1],
-            price_out=prices[2],
+            price_in=eff_prices[0],
+            price_cache=eff_prices[1],
+            price_out=eff_prices[2],
             bar_width=int(_setting("bar_width", 10) or 10),
             cost_decimals=int(_setting("cost_decimals", 3) or 3),
             context_hint_pct=int(_setting("context_hint_pct", 70) or 0),
