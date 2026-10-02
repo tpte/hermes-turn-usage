@@ -9,8 +9,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from summary import (cache_pct, diff_totals, format_block, merge_sources,
-                      route_text, strip_previous_block)  # noqa: E402
+from summary import (cache_pct, composition_groups, diff_totals, format_block,
+                      merge_sources, route_text, set_language, strip_previous_block)  # noqa: E402
+
+
+def setUpModule():
+    """既有案例斷言的是中文文案，統一在 zh 模式跑。
+
+    頁腳的**預設**是英文（catalog 的 English-first 要求）；英文預設與語言切換
+    由 TestLanguage 另外覆蓋，這裡只是把舊案例的語言前提寫明，不放寬斷言。
+    """
+    set_language("zh")
+
+
+def tearDownModule():
+    set_language("en")
 
 
 class TestCachePct(unittest.TestCase):
@@ -280,6 +293,67 @@ class TestContextHint(unittest.TestCase):
 
     def test_silent_without_context_max(self):
         self.assertNotIn("建議換新對話", self._render(prompt_now=900_000, context_max=None))
+
+
+class TestLanguage(unittest.TestCase):
+    """English-first：頁腳預設英文，`language=zh` 才切中文（兩種都必須可用）。"""
+
+    DELTA = {"calls": 3, "in": 1000, "cache": 9000, "out": 500, "cost": 0.01, "reasoning": 200}
+
+    def tearDown(self):
+        set_language("zh")  # 還原成舊案例的語言前提（見 setUpModule）
+
+    def _render(self, **kw):
+        return format_block(self.DELTA, dict(self.DELTA), model="m", route="?", **kw)
+
+    def test_english_is_the_default(self):
+        set_language("en")
+        text = self._render(prompt_now=800_000, context_max=1_000_000)
+        self.assertIn("<details><summary>📊usage $0.010", text)
+        self.assertIn("Cumulative", text)
+        self.assertIn("start a new chat", text)
+        self.assertNotIn("用量", text)
+
+    def test_chinese_switch_keeps_traditional_strings(self):
+        set_language("zh")
+        text = self._render(prompt_now=800_000, context_max=1_000_000)
+        self.assertIn("<details><summary>📊用量 $0.010", text)
+        self.assertIn("累計", text)
+        self.assertIn("建議換新對話", text)
+
+    def test_zh_prefix_and_alias_forms(self):
+        for value in ("zh", "zh-TW", "zh_TW", "CHINESE", "中文"):
+            set_language(value)
+            self.assertEqual(_current_language(), "zh", value)
+
+    def test_unknown_language_falls_back_to_english(self):
+        set_language("fr")
+        self.assertEqual(_current_language(), "en")
+
+    def test_english_block_is_recognised_and_stripped(self):
+        set_language("en")
+        block = self._render()
+        self.assertEqual(strip_previous_block("body\n\n" + block), "body")
+        # 語言切換後，舊語言留下的區塊也剝得掉（regex 兩種都認）
+        set_language("zh")
+        self.assertEqual(strip_previous_block("body\n\n" + self._render()), "body")
+
+    def test_english_group_labels(self):
+        set_language("en")
+        rows = dict(merge_sources([("terminal", 300), ("read_file", 100)]))
+        self.assertEqual(rows["💻 Command line"], 75)
+        self.assertEqual(rows["📄 File read"], 25)
+
+    def test_composition_groups_track_the_language(self):
+        set_language("en")
+        self.assertEqual(composition_groups()[0][0], "💻 Command line")
+        set_language("zh")
+        self.assertEqual(composition_groups()[0][0], "💻 命令行")
+
+
+def _current_language():
+    from summary import _LANGUAGE
+    return _LANGUAGE
 
 
 if __name__ == "__main__":

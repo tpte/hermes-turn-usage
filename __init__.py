@@ -18,31 +18,29 @@ from datetime import datetime
 from pathlib import Path
 
 def _load_summary():
-    """載入實作模組（summary.py）——三種載入路徑都試。
+    """載入實作模組（summary.py）——相對匯入失敗時，用唯一命名的 spec loader。
 
-    fallback 那條一定要先把模組註冊進 `sys.modules`：`importlib.reload()` 只認
-    已在 sys.modules 的模組，沒註冊就會拋錯、熱重載等於失效。
+    刻意不用 `import summary`：那是無前綴的頂層匯入，會綁到 sys.path 上任何一個
+    叫 `summary` 的模組（可能完全不是我們這支）。spec loader 用獨一無二的名字
+    （`turn_usage_summary`），且先註冊進 `sys.modules`——`importlib.reload()`
+    只認已在 sys.modules 的模組，沒註冊熱重載就會失效。
     """
     try:  # 以 package 載入
         from . import summary as _s
         return _s
     except ImportError:
         pass
-    try:  # 以頂層模組載入
-        import summary as _s
-        return _s
-    except ImportError:  # 目錄不在 sys.path：直接從同目錄載入
-        import sys
-        name = "turn_usage_summary"
-        if name in sys.modules:
-            return sys.modules[name]
-        _spec = importlib.util.spec_from_file_location(
-            name, Path(__file__).with_name("summary.py")
-        )
-        _s = importlib.util.module_from_spec(_spec)
-        sys.modules[name] = _s
-        _spec.loader.exec_module(_s)
-        return _s
+    import sys
+    name = "turn_usage_summary"  # 目錄不在 sys.path：從同目錄以具名 spec 載入
+    if name in sys.modules:
+        return sys.modules[name]
+    _spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).with_name("summary.py")
+    )
+    _s = importlib.util.module_from_spec(_spec)
+    sys.modules[name] = _s
+    _spec.loader.exec_module(_s)
+    return _s
 
 
 #: 熱重載用：目前採用的實作模組與它的檔案時間。
@@ -99,7 +97,10 @@ logger = logging.getLogger(__name__)
 HOME = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
 DB_PATH = HOME / "state.db"
 LOG_PATH = HOME / "logs" / "agent.log"
-SNAP_DIR = HOME / "cache" / "turn-usage"
+#: 外掛的持久資料放 plugin-data（與 Hermes 的 plugin state 慣例一致）。
+#: 舊版寫在 cache/turn-usage/，讀取時仍會回那裡找，既有使用者的累計不會斷。
+SNAP_DIR = HOME / "plugin-data" / "hermes-turn-usage"
+LEGACY_SNAP_DIR = HOME / "cache" / "turn-usage"
 
 TIMEOUT_S = 2.0  # 查 DB 的硬上限，hook 絕不能拖慢回覆
 LOG_TAIL_BYTES = 400_000  # 只讀 log 尾端這麼多，避免掃大檔
@@ -114,6 +115,14 @@ PROVIDER_PRICES = {
     "example-alias-b": (0.285, 0.0057, 1.14),
 }
 FALLBACK_PRICES = (0.30, 0.006, 1.20)
+
+
+def _unit_prices(provider: str, prices=None):
+    """(輸入, 快取, 輸出) 的 $/M 單價：以設定（price_in／price_cache／price_out）為準，
+    沒傳設定才退回內建的範例價格表。"""
+    if prices is not None:
+        return prices
+    return PROVIDER_PRICES.get((provider or "").lower(), FALLBACK_PRICES)
 
 _TOTALS_SQL = """
     SELECT model, billing_provider, task, SUM(api_call_count), SUM(input_tokens),
@@ -137,8 +146,12 @@ def _connect() -> sqlite3.Connection:
     return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=TIMEOUT_S)
 
 
-def load_totals(session_id: str):
-    """該 session 的累計（含全部 task）。主對話的 provider 另外列出當「路由」。"""
+def load_totals(session_id: str, prices=None):
+    """該 session 的累計（含全部 task）。主對話的 provider 另外列出當「路由」。
+
+    ``prices`` 是 (輸入, 快取, 輸出) 的 $/M 單價三元組，由外掛設定提供；
+    沒給才退回內建的範例價格表。
+    """
     try:
         con = _connect()
     except sqlite3.Error:
@@ -161,9 +174,9 @@ def load_totals(session_id: str):
         totals["out"] += tout or 0
         totals["cache"] += tcache or 0
         totals["reasoning"] += treason or 0
-        # 花費改用「token × 現場單價」實算（2026-10-01 校正：Hermes 的 estimated_cost_usd
-        # 低估約 20–29%，實算與 router 官方 key usage 只差 0.6%）。
-        pin, pc, po = PROVIDER_PRICES.get((provider or "").lower(), FALLBACK_PRICES)
+        # 花費改用「token × 單價」實算（Hermes 的 estimated_cost_usd 低估約 20–29%，
+        # 實算與 router 官方 key usage 只差 0.6%）。單價以設定為準；沒設定才用範例表。
+        pin, pc, po = _unit_prices(provider, prices)
         totals["cost"] += (tin or 0) / 1e6 * pin + (tcache or 0) / 1e6 * pc + (tout or 0) / 1e6 * po
         totals["cost_est"] += est or 0.0
         if model and (calls or 0) > top_calls:
@@ -281,10 +294,14 @@ def _snap_path(session_id: str) -> Path:
 
 
 def read_snapshot(session_id: str):
-    try:
-        return json.loads(_snap_path(session_id).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+    """讀上一輪快照；新位置沒有就回舊位置找，既有使用者的累計不會斷。"""
+    for path in (_snap_path(session_id),
+                 LEGACY_SNAP_DIR / f"{session_id}.json"):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def write_snapshot(session_id: str, totals: dict, extra: dict | None = None) -> None:
@@ -362,17 +379,34 @@ def prompt_composition(session_id: str, since_ts=None):
     return [(name or "", chars or 0) for name, chars in rows] or None
 
 
+#: register(ctx) 抓到的外掛 context；設定一律經它讀（見 _setting）。
+_CTX = None
+
+
 def _setting(key: str, default):
-    """讀 plugin.yaml 的 config_schema 值；Hermes 版本沒有這個 API 就用預設。"""
-    for module_name, attr in (("hermes_cli.plugins", "plugin_setting"),):
+    """讀設定：`ctx.get_config(key, default)`（config_schema 的 plugins.entries 設定）。
+
+    Hermes 沒有舊版猜測的 `hermes_cli.plugins.plugin_setting`；設定只有 ctx 這條路。
+    沒 ctx（例如單獨匯入模組測試）或讀取失敗就回傳預設值。
+    """
+    ctx = _CTX
+    if ctx is not None:
         try:
-            module = __import__(module_name, fromlist=[attr])
-            getter = getattr(module, attr, None)
-            if getter is not None:
-                return getter("turn-usage", key, default)
+            value = ctx.get_config(key, default)
+            if value is not None:
+                return value
         except Exception:
-            continue
+            logger.debug("turn-usage: 讀設定 %s 失敗，改用預設", key, exc_info=True)
     return default
+
+
+def _fsetting(key: str, default: float) -> float:
+    """讀 float 設定；值不合法或為 0 時退回預設（單價 0 沒有意義）。"""
+    try:
+        value = float(_setting(key, default))
+    except (TypeError, ValueError):
+        return default
+    return value or default
 
 
 def _composition_groups():
@@ -401,9 +435,14 @@ def _composition_groups():
 def transform(response_text, session_id, model, platform, **kwargs):
     """transform_llm_output callback：回傳附加摘要後的回覆。"""
     try:
+        if not _setting("enabled", True):
+            return None
         if not response_text or not session_id:
             return None
-        totals = load_totals(session_id)
+        prices = (_fsetting("price_in", 0.14),
+                  _fsetting("price_cache", 0.0042),
+                  _fsetting("price_out", 0.42))
+        totals = load_totals(session_id, prices)
         if not totals:
             return None
         # 診斷用：一次 turn 內這個 hook 到底被叫了幾次、各帶哪個 session_id。
@@ -415,6 +454,7 @@ def transform(response_text, session_id, model, platform, **kwargs):
         )
         prev = read_snapshot(session_id)
         impl = _impl()
+        impl.set_language(_setting("language", "en"))
         delta = impl.diff_totals(totals, prev)
         since_ts = (prev or {}).get("ts")
         timing = turn_timing(session_id, since_ts)
@@ -461,9 +501,9 @@ def transform(response_text, session_id, model, platform, **kwargs):
             show_composition=bool(_setting("show_composition", True)),
             show_bars=bool(_setting("show_bars", True)),
             show_cost_breakdown=bool(_setting("show_cost_breakdown", True)),
-            price_in=float(_setting("price_in", 0.14) or 0.14),
-            price_cache=float(_setting("price_cache", 0.0042) or 0.0042),
-            price_out=float(_setting("price_out", 0.42) or 0.42),
+            price_in=prices[0],
+            price_cache=prices[1],
+            price_out=prices[2],
             bar_width=int(_setting("bar_width", 10) or 10),
             cost_decimals=int(_setting("cost_decimals", 3) or 3),
             context_hint_pct=int(_setting("context_hint_pct", 70) or 0),
@@ -483,4 +523,6 @@ def transform(response_text, session_id, model, platform, **kwargs):
 
 
 def register(ctx):
+    global _CTX
+    _CTX = ctx  # 設定一律經 ctx.get_config 讀（見 _setting）
     ctx.register_hook("transform_llm_output", transform)

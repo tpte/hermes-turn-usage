@@ -7,17 +7,35 @@ from typing import Optional
 
 FIELDS = ("calls", "in", "out", "cache", "cost", "reasoning")
 
-#: 摘要區塊的辨識錨點。`format_block` 的標題行固定以它開頭。
-BLOCK_MARKER = "<details><summary>📊用量"
+#: 頁腳語言。預設英文（catalog 外掛要求 English-first）；設 "zh" 才用中文。
+_LANGUAGE = "en"
+
+
+def set_language(lang) -> None:
+    """設定頁腳語言：`zh*` / `chinese` / `中文` → 中文，其餘一律英文。
+
+    由外掛的 `language` 設定呼叫（__init__.py 的 transform）；本模組預設英文。
+    """
+    global _LANGUAGE
+    text = str(lang or "").strip().lower()
+    _LANGUAGE = "zh" if text.startswith("zh") or text in ("chinese", "中文", "繁中") else "en"
+
+
+def _t(en: str, zh: str) -> str:
+    """雙語字串：英文預設，`language=zh` 時用中文。"""
+    return zh if _LANGUAGE == "zh" else en
+
+
+#: 摘要區塊的辨識錨點。`format_block` 的標題行固定以它開頭（英文為預設語言）。
+BLOCK_MARKER = "<details><summary>📊usage"
 #: 舊版標題（一行式之前），只用來剥掉歷史訊息裡殘留的舊區塊。
 LEGACY_MARKER = "📊 **本輪用量**"
 
-#: 用量摘要的辨識：`<details><summary>` 裡含 📊 與「用量」就算——**不靠字面比對**。
-#: 為什麼：歷史上有過多種標題寫法（`📊用量`、`📊 用量 ｜ ⏱️ 活躍`、`📊 **本輪用量**`…），
+#: 用量摘要的辨識：`<details><summary>` 裡含 📊 與「用量」或「usage」就算——**不靠字面比對**。
+#: 為什麼：歷史上有過多種標題寫法（`📊用量`、`📊usage`、`📊 用量 ｜ ⏱️ 活躍`…），
 #: 字面比對只要差一個空格就找不到 → 舊的那一份留著、新的又接上去，畫面就出現兩份。
-#: 實例：同一則回覆裡「📊 用量 …」接著「📊用量 …」，一新一舊並存
-#: （舊那份來自某個先前載入的版本）。
-_BLOCK_RE = re.compile(r"<details\s*>\s*<summary\s*>[^<]*📊[^<]*用量")
+#: 兩種語言都認，使用者在 en／zh 之間切換時也不會留下孤兒區塊。
+_BLOCK_RE = re.compile(r"<details\s*>\s*<summary\s*>[^<]*📊[^<]*(?:用量|usage)")
 #: 更早的兩行式（沒有 `<details>` 包住）：`📊 **本輪用量** 💰…`
 _LEGACY_RE = re.compile(r"📊\s*\*\*本輪用量\*\*")
 
@@ -118,7 +136,16 @@ def _pct(v: Optional[int]) -> str:
 #: 訊息內容的分類。key 是顯示名，值是 tool_name（`""` = 使用者／助理的對話內容）。
 #: 「改檔」與「讀檔」刻意分開：diff 進 context 的量是「我改了幾個檔」的證據，
 #: 和「讀了多少檔案」是兩件事，混在一起會誤導。
-COMPOSITION_GROUPS = (
+COMPOSITION_GROUPS_EN = (
+    ("💻 Command line", ("terminal", "execute_code", "process_manage")),
+    ("🔧 File edit", ("patch", "write_file")),
+    ("📄 File read", ("read_file", "search_files")),
+    ("👁️ Image recognition", ("vision_analyze",)),
+    ("🌐 Network", ("web_search", "web_extract", "browser_exec")),
+    ("📚 Skills", ("skill_view", "skill_manage", "skills_list")),
+    ("🧠 Memory", ("memory",)),
+)
+COMPOSITION_GROUPS_ZH = (
     ("💻 命令行", ("terminal", "execute_code", "process_manage")),
     ("🔧 改檔", ("patch", "write_file")),
     ("📄 讀檔", ("read_file", "search_files")),
@@ -127,6 +154,11 @@ COMPOSITION_GROUPS = (
     ("📚 skill", ("skill_view", "skill_manage", "skills_list")),
     ("🧠 記憶", ("memory",)),
 )
+
+
+def composition_groups():
+    """目前語言的分類表（使用者自訂 `composition_groups` 設定會覆寫它）。"""
+    return COMPOSITION_GROUPS_ZH if _LANGUAGE == "zh" else COMPOSITION_GROUPS_EN
 
 
 def merge_sources(sources, groups=None) -> list:
@@ -139,7 +171,7 @@ def merge_sources(sources, groups=None) -> list:
     total = sum(chars for _name, chars in sources) or 0
     if not total:
         return []
-    table = groups or COMPOSITION_GROUPS
+    table = groups or composition_groups()
     buckets: dict[str, int] = {}
     for name, chars in sources:
         label = None
@@ -148,7 +180,7 @@ def merge_sources(sources, groups=None) -> list:
                 label = group_label
                 break
         if label is None:
-            label = "💬 對話" if not name else ("🧰 其他工具")
+            label = _t("💬 Chat", "💬 對話") if not name else _t("🧰 Other tools", "🧰 其他工具")
         buckets[label] = buckets.get(label, 0) + chars
     rows = sorted(buckets.items(), key=lambda kv: -kv[1])
     out, rest = [], 0
@@ -159,16 +191,16 @@ def merge_sources(sources, groups=None) -> list:
             continue
         out.append((label, pct))
     if rest:
-        out.append(("▫️ 其他", round(rest / total * 100)))
+        out.append((_t("▫️ Other", "▫️ 其他"), round(rest / total * 100)))
     return out
 
 
 def _tool_label(tool: str, table) -> str:
-    """工具名 → 大類顯示名；不在分類表裡的一律歸「🧰 其他工具」。"""
+    """工具名 → 大類顯示名；不在分類表裡的一律歸「其他工具」。"""
     for group_label, members in table:
         if tool in members:
             return group_label
-    return "🧰 其他工具"
+    return _t("🧰 Other tools", "🧰 其他工具")
 
 
 def tool_time_rows(by_tool, cum_by_tool=None, groups=None, active_s=0.0,
@@ -182,7 +214,7 @@ def tool_time_rows(by_tool, cum_by_tool=None, groups=None, active_s=0.0,
     細項回答「具體哪一支工具」。但只有佔比過 ``min_pct``、且類裡不只一支
     工具的大類才展開細項——否則一整排 0.1s 的工具會把明細淹掉。
     """
-    table = groups or COMPOSITION_GROUPS
+    table = groups or composition_groups()
     buckets: dict[str, list] = {}   # 大類 → [秒, 次, {工具: [秒, 次]}]
     for name, pair in (by_tool or {}).items():
         try:
@@ -244,19 +276,21 @@ def _cost_table(delta: dict, p_in: float, p_cache: float, p_out: float,
     if not enabled or not (p_in or p_cache or p_out):
         return []
     inp, cache, out = (delta.get("in") or 0), (delta.get("cache") or 0), (delta.get("out") or 0)
-    parts = [("📥 輸入（未快取）", inp, inp * p_in),
-             ("💾 快取命中", cache, cache * p_cache),
-             ("📤 輸出", out, out * p_out)]
-    weight = sum(w for _n, _t, w in parts)
+    parts = [(_t("📥 Input (uncached)", "📥 輸入（未快取）"), inp, inp * p_in),
+             (_t("💾 Cache hit", "💾 快取命中"), cache, cache * p_cache),
+             (_t("📤 Output", "📤 輸出"), out, out * p_out)]
+    weight = sum(w for _n, _tok, w in parts)
     if not weight:
         return []
     actual = delta.get("cost") or 0.0
     table = [
         "",
-        f"**花費組成**（單價 in ${p_in}／cache ${p_cache}／out ${p_out} per M；"
-        f"依比例對齊帳單 ${actual:.4f}）",
+        _t(f"**Cost breakdown** (unit prices in ${p_in} / cache ${p_cache} / out ${p_out} per M; "
+           f"scaled to the billed ${actual:.4f})",
+           f"**花費組成**（單價 in ${p_in}／cache ${p_cache}／out ${p_out} per M；"
+           f"依比例對齊帳單 ${actual:.4f}）"),
         "",
-        "| 項目 | token | 花費 | 佔比 |",
+        _t("| Item | tokens | cost | share |", "| 項目 | token | 花費 | 佔比 |"),
         "|---|---|---|---|",
     ]
     for name, tokens, w in parts:
@@ -313,9 +347,10 @@ def format_block(
     tool_s = float(timing.get("tool_s") or 0) if timing else 0.0
     active = think_s + tool_s
     cum_active = float(timing.get("cum_active_s") or 0) if timing else 0.0
-    head = ("<details><summary>📊用量 " + cost
-            + (f" ⏱️活躍 {_dur(active)}" if active else "")
-            + (f" ⚠️context {_pct(ctx_pct)} 建議換新對話" if ctx_hint else "")
+    head = (_t(f"<details><summary>📊usage {cost}", f"<details><summary>📊用量 {cost}")
+            + (_t(f" ⏱️active {_dur(active)}", f" ⏱️活躍 {_dur(active)}") if active else "")
+            + (_t(f" ⚠️context {_pct(ctx_pct)} — start a new chat",
+                  f" ⚠️context {_pct(ctx_pct)} 建議換新對話") if ctx_hint else "")
             + "</summary>")
 
     time_row, time_table = "", []
@@ -331,13 +366,15 @@ def format_block(
         cum_tool = float(timing.get("cum_tool_s") or 0)
         time_table = [
             "",
-            "**時間分配**（不含你閱讀與輸入的時間）",
+            _t("**Time breakdown** (excludes your reading and typing)",
+               "**時間分配**（不含你閱讀與輸入的時間）"),
             "",
-            "| 來源 | 本輪 | 累積 | 本輪佔比 | 次數 |",
+            _t("| Source | This turn | Cumulative | Share | Calls |",
+               "| 來源 | 本輪 | 累積 | 本輪佔比 | 次數 |"),
             "|---|---|---|---|---|",
-            f"| 🧠 模型思考／生成 | {_dur(think_s)} | "
+            f"| {_t('🧠 Model thinking / generation', '🧠 模型思考／生成')} | {_dur(think_s)} | "
             f"{_dur(cum_think) if cum_think else '—'} | {tp}% | {n_calls} |",
-            f"| ⚙️ 工具執行 | {_dur(tool_s)} | "
+            f"| {_t('⚙️ Tool execution', '⚙️ 工具執行')} | {_dur(tool_s)} | "
             f"{_dur(cum_tool) if cum_tool else '—'} | {op}% | {n_tools} |",
         ]
         # 工具那一列再往下拆：大類（⤷）回答「哪一類工作」，細項（└）回答
@@ -358,35 +395,37 @@ def format_block(
         if wait_s or n_waits:
             cum_wait = float(timing.get("cum_wait_s") or 0)
             time_table.append(
-                f"| ⏸️ 等你回應 | {_dur(wait_s)} | "
-                f"{_dur(cum_wait) if cum_wait else '—'} | 不計入 | {n_waits} |")
+                f"| {_t('⏸️ Waiting for you', '⏸️ 等你回應')} | {_dur(wait_s)} | "
+                f"{_dur(cum_wait) if cum_wait else '—'} | {_t('not counted', '不計入')} | {n_waits} |")
         time_table.append("")
 
     if show_total:
         table = [
-            "|  | 本輪 | 累計 |",
+            _t("|  | This turn | Cumulative |", "|  | 本輪 | 累計 |"),
             "|---|---|---|",
-            f"| ⚡ 呼叫 | {delta['calls']} | {totals.get('calls', 0)} |",
-            f"| 📥 進 | {_k(prompt_total)} | {_k(t_in)} |",
-            f"| 💾 快取命中 | {_pct(hit)} | {_pct(t_hit)} |",
-            f"| 📤 出 | {_k(delta['out'])} | {_k(totals.get('out', 0))} |",
-            f"| 🤔 推理 | {_pct(reason_pct)} | {_pct(t_reason)} |",
-            f"| ⏱️ 活躍 | {_dur(active)} | {_dur(cum_active) if cum_active else '—'} |",
-            f"| 💰 花費 | ${delta['cost']:.4f} | ${totals.get('cost', 0) or 0:.4f} |",
+            f"| {_t('⚡ Calls', '⚡ 呼叫')} | {delta['calls']} | {totals.get('calls', 0)} |",
+            f"| {_t('📥 In', '📥 進')} | {_k(prompt_total)} | {_k(t_in)} |",
+            f"| {_t('💾 Cache hit', '💾 快取命中')} | {_pct(hit)} | {_pct(t_hit)} |",
+            f"| {_t('📤 Out', '📤 出')} | {_k(delta['out'])} | {_k(totals.get('out', 0))} |",
+            f"| {_t('🤔 Reasoning', '🤔 推理')} | {_pct(reason_pct)} | {_pct(t_reason)} |",
+            f"| {_t('⏱️ Active', '⏱️ 活躍')} | {_dur(active)} | {_dur(cum_active) if cum_active else '—'} |",
+            f"| {_t('💰 Cost', '💰 花費')} | ${delta['cost']:.4f} | ${totals.get('cost', 0) or 0:.4f} |",
         ]
     else:
         table = [
-            "|  | 本輪 |",
+            _t("|  | This turn |", "|  | 本輪 |"),
             "|---|---|",
-            f"| ⚡ 呼叫 | {delta['calls']} |",
-            f"| 📥 進 | {_k(prompt_total)} |",
-            f"| 💾 快取命中 | {_pct(hit)} |",
-            f"| 📤 出 | {_k(delta['out'])} |",
-            f"| 🤔 推理 | {_pct(reason_pct)} |",
-            f"| 💰 花費 | ${delta['cost']:.4f} |",
+            f"| {_t('⚡ Calls', '⚡ 呼叫')} | {delta['calls']} |",
+            f"| {_t('📥 In', '📥 進')} | {_k(prompt_total)} |",
+            f"| {_t('💾 Cache hit', '💾 快取命中')} | {_pct(hit)} |",
+            f"| {_t('📤 Out', '📤 出')} | {_k(delta['out'])} |",
+            f"| {_t('🤔 Reasoning', '🤔 推理')} | {_pct(reason_pct)} |",
+            f"| {_t('💰 Cost', '💰 花費')} | ${delta['cost']:.4f} |",
         ]
 
-    ctx_note = f"（{_k(prompt_now)}／{_k(context_max)}）" if (prompt_now and context_max) else ""
+    ctx_note = _t(f" ({_k(prompt_now)} / {_k(context_max)})",
+                  f"（{_k(prompt_now)}／{_k(context_max)}）") \
+        if (prompt_now and context_max) else ""
     now_rows = merge_sources(sources, groups) if sources else []
     delta_rows = merge_sources(sources_delta, groups) if sources_delta else []
     comp_table = []
@@ -397,22 +436,23 @@ def format_block(
                 names.append(lbl)
         d_map, n_map = dict(delta_rows), dict(now_rows)
         comp_table = [
-            "**prompt 組成**（不含系統提示與工具定義）",
+            _t("**Prompt composition** (excludes system prompt and tool definitions)",
+               "**prompt 組成**（不含系統提示與工具定義）"),
             "",
-            "| 來源 | 本輪 | 累積 |",
+            _t("| Source | This turn | Cumulative |", "| 來源 | 本輪 | 累積 |"),
             "|---|---|---|",
         ] + [f"| {lbl} | {d_map.get(lbl, 0)}% | {n_map.get(lbl, 0)}% |" for lbl in names] + [""]
     detail = [
         "",
-        f"`{model}`　路由 {route}",
+        f"`{model}` {_t('route', '路由')} {route}",
         "",
         f"🧠 context `{_k(prompt_now) if prompt_now else '—'}`"
-        + (f"／上限 {_k(context_max)}" if context_max else ""),
+        + (_t(f" / max {_k(context_max)}", f"／上限 {_k(context_max)}") if context_max else ""),
         "",
     ] + table + ([] if not show_bars else [
         "",
-        f"快取命中　{_bar(hit, bar_width)} {_pct(hit)}",
-        f"推理佔比　{_bar(reason_pct, bar_width)} {_pct(reason_pct)}",
+        f"{_t('Cache hit', '快取命中')}　{_bar(hit, bar_width)} {_pct(hit)}",
+        f"{_t('Reasoning share', '推理佔比')}　{_bar(reason_pct, bar_width)} {_pct(reason_pct)}",
         f"context　　{_bar(ctx_pct, bar_width)} {_pct(ctx_pct)}{ctx_note}",
         "",
     ]) + _cost_table(delta, price_in, price_cache, price_out,

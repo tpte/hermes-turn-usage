@@ -1,75 +1,86 @@
 name: turn-usage
 version: "1.0"
-description: 每輪結束時在回覆尾端附上用量摘要（模型／路由／token／cache 比例／花費／context 使用率）。純程式計算，不呼叫模型。
+description: >-
+  Appends a compact usage summary to the end of every reply (model / route / tokens /
+  cache hit rate / cost / context occupancy). Pure computation — it never calls a model.
+  中文：每輪結束時在回覆尾端附上用量摘要（模型／路由／token／cache 比例／花費／context 使用率），純程式計算，不呼叫模型。
 provides_hooks:
   - transform_llm_output
 config_schema:
   enabled:
     type: bool
-    label: 啟用
-    description: 關掉就等於停用，不必卸載。
+    label: Enable（啟用）
+    description: Turn the footer off without uninstalling. 關掉就等於停用，不必卸載。
     default: true
+  language:
+    type: str
+    label: Footer language（頁腳語言）
+    description: >-
+      "en" (default) for English, "zh" for Traditional Chinese.
+      頁腳語言：en（預設英文）或 zh（繁體中文）。
+    default: "en"
   show_session_total:
     type: bool
-    label: 同時顯示本對話累計
-    description: 開起來會多一行累計花費與總 token。
+    label: Session totals（顯示本對話累計）
+    description: Add a cumulative column for cost and total tokens. 開起來會多一行累計花費與總 token。
     default: true
   show_bars:
     type: bool
-    label: 顯示方塊條
-    description: 明細裡快取命中／推理佔比／context 三條方塊條。
+    label: Meter bars（顯示方塊條）
+    description: The three meter bars — cache hit / reasoning share / context. 明細裡快取命中／推理佔比／context 三條方塊條。
     default: true
   show_cost_breakdown:
     type: bool
-    label: 顯示花費組成
-    description: 把帳單拆成「輸入／快取命中／輸出」三塊並標出各佔多少錢。
+    label: Cost breakdown（顯示花費組成）
+    description: Split the bill into input / cache hit / output and show each part's share. 把帳單拆成「輸入／快取命中／輸出」三塊並標出各佔多少錢。
     default: true
   price_in:
     type: float
-    label: 輸入單價（每百萬 token）
-    description: 供應商單價會變動，改這裡立即生效。預設值只是範例，請換成你所用 provider 的現價。
+    label: Input price per M tokens（輸入單價，每百萬 token）
+    description: Provider prices change; editing this takes effect immediately. The default is only an example — set your own provider's live price. 預設值只是範例，請換成你所用 provider 的現價。
     default: 0.14
   price_cache:
     type: float
-    label: 快取命中單價（每百萬 token）
-    description: 通常比輸入便宜一個量級，但量大時仍是花費大宗。
+    label: Cache-read price per M tokens（快取命中單價，每百萬 token）
+    description: Usually an order of magnitude cheaper than input, but still the largest line at high volume. 通常比輸入便宜一個量級，但量大時仍是花費大宗。
     default: 0.0042
   price_out:
     type: float
-    label: 輸出單價（每百萬 token）
+    label: Output price per M tokens（輸出單價，每百萬 token）
+    description: Provider prices change; editing this takes effect immediately. The default is only an example. 供應商單價會變動，改這裡立即生效；預設值只是範例。
     default: 0.42
   show_time_table:
     type: bool
-    label: 顯示時間分配
-    description: 明細裡的「時間分配」表（模型思考 vs 工具執行，本輪與累積）。
+    label: Time breakdown（顯示時間分配）
+    description: The time table — model thinking vs tool execution, this turn and cumulative. 明細裡的「時間分配」表（模型思考 vs 工具執行，本輪與累積）。
     default: true
   time_detail_min_pct:
     type: int
-    label: 工具細項展開門檻（%）
-    description: 某類工具佔活躍時間超過這個百分比、且該類不只一支工具，才展開它底下的細項（例如圖片識別、寫 code 各花幾秒）。調高＝列數更少；填 0 則全部展開。
+    label: Tool detail threshold %（工具細項展開門檻）
+    description: A tool category expands into per-tool rows only if it holds more than one tool and reaches this share of active time. Raise it for fewer rows; 0 = always expand. 調高＝列數更少；填 0 則全部展開。
     default: 10
   show_composition:
     type: bool
-    label: 顯示 prompt 組成
-    description: 明細裡的「prompt 組成」表（各來源佔比，本輪與累積）。
+    label: Prompt composition（顯示 prompt 組成）
+    description: The prompt-composition table — share per source, this turn and cumulative. 明細裡的「prompt 組成」表（各來源佔比，本輪與累積）。
     default: true
   bar_width:
     type: int
-    label: 方塊條長度（格）
-    description: 方塊條的格數。10 格＝每格 10%。
+    label: Meter width in cells（方塊條長度）
+    description: Number of cells per meter bar; 10 cells = 10% each. 方塊條的格數。10 格＝每格 10%。
     default: 10
   cost_decimals:
     type: int
-    label: 外行花費小數位
-    description: 外行那行顯示到小數第幾位（0–6）；明細表固定保留四位。
+    label: Collapsed-line decimals（外行花費小數位）
+    description: Decimal places for cost on the collapsed line (0–6); detail tables always keep four. 外行那行顯示到小數第幾位（0–6）；明細表固定保留四位。
     default: 3
   context_hint_pct:
     type: int
-    label: context 提醒門檻（%）
-    description: context 用到這個百分比就在外行那行標 ⚠️ 並建議換新對話（長 context 每輪都重送，又貴又慢）。填 0 關掉。
+    label: Context warning threshold %（context 提醒門檻）
+    description: Mark the collapsed line with a warning once context occupancy reaches this percentage (long context is re-sent every turn — slow and costly). 0 = off. 填 0 關掉。
     default: 70
   composition_groups:
     type: str
-    label: prompt 組成分類（進階）
-    description: '每行一組，格式「群組名 = 工具1,工具2」；留空用內建分類。例：想把改檔算回檔案就寫「檔案 = read_file,search_files,patch,write_file」。'
+    label: Prompt composition groups（prompt 組成分類，進階）
+    description: 'One group per line, "Label = tool1,tool2"; leave empty for the built-in groups. Example: "files = read_file,search_files,patch,write_file". 每行一組，格式「群組名 = 工具1,工具2」；留空用內建分類。'
     default: ""
